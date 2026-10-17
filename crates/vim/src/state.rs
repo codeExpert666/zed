@@ -15,8 +15,8 @@ use editor::display_map::{is_invisible, replacement};
 use editor::{Anchor, ClipboardSelection, Editor, MultiBuffer, ToPoint as EditorToPoint};
 use gpui::{
     Action, App, AppContext, BorrowAppContext, ClipboardEntry, ClipboardItem, DismissEvent, Entity,
-    EntityId, Global, HighlightStyle, StyledText, Subscription, Task, TaskExt, TextStyle,
-    WeakEntity,
+    EntityId, FocusHandle, Global, HighlightStyle, StyledText, Subscription, Task, TaskExt,
+    TextStyle, WeakEntity,
 };
 use language::{Buffer, BufferEvent, BufferId, Chunk, LanguageAwareStyling, Point};
 
@@ -26,9 +26,15 @@ use project::{Project, ProjectItem, ProjectPath};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::borrow::BorrowMut;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
-use std::{fmt::Display, ops::Range, sync::Arc};
+use std::rc::Rc;
+use std::{
+    fmt::Display,
+    ops::{Deref, DerefMut, Range},
+    sync::Arc,
+};
 use text::{Bias, ToPoint};
 use theme_settings::ThemeSettings;
 use ui::{
@@ -250,28 +256,14 @@ impl From<String> for Register {
 pub struct VimGlobals {
     pub last_find: Option<Motion>,
 
-    pub dot_recording: bool,
     pub dot_replaying: bool,
-
-    /// pre_count is the number before an operator is specified (3 in 3d2d)
-    pub pre_count: Option<usize>,
-    /// post_count is the number after an operator is specified (2 in 3d2d)
-    pub post_count: Option<usize>,
-    pub forced_motion: bool,
-    pub stop_recording_after_next_action: bool,
-    pub ignore_current_insertion: bool,
-    pub recording_count: Option<usize>,
     pub recorded_count: Option<usize>,
-    pub recording_actions: Vec<ReplayableAction>,
     pub recorded_actions: Vec<ReplayableAction>,
     pub recorded_selection: RecordedSelection,
 
     /// The register being written to by the active `q{register}` macro
     /// recording.
     pub recording_register: Option<char>,
-    /// The register that was selected at the start of the current
-    /// dot-recording, for example, `"ap`.
-    pub recording_register_for_dot: Option<char>,
     /// The register from the last completed dot-recording. Used when replaying
     /// with `.`.
     pub recorded_register_for_dot: Option<char>,
@@ -286,6 +278,63 @@ pub struct VimGlobals {
     pub focused_vim: Option<WeakEntity<Vim>>,
 
     pub marks: HashMap<EntityId, Entity<MarksState>>,
+
+    pub(crate) keystroke_observers: Vec<(FocusHandle, WeakEntity<Vim>)>,
+    pub(crate) input: Rc<RefCell<VimInputState>>,
+    focused_input: Rc<RefCell<VimInputState>>,
+    input_depth: usize,
+    command: VimCommandState,
+}
+
+#[derive(Default)]
+pub struct VimCommandState {
+    pub dot_recording: bool,
+    /// pre_count is the number before an operator is specified (3 in 3d2d)
+    pub pre_count: Option<usize>,
+    /// post_count is the number after an operator is specified (2 in 3d2d)
+    pub post_count: Option<usize>,
+    pub forced_motion: bool,
+    pub stop_recording_after_next_action: bool,
+    pub ignore_current_insertion: bool,
+    pub recording_count: Option<usize>,
+    pub recording_actions: Vec<ReplayableAction>,
+    pub recording_selection: RecordedSelection,
+    /// The register that was selected at the start of the current
+    /// dot-recording, for example, `"ap`.
+    pub recording_register_for_dot: Option<char>,
+}
+
+impl Deref for VimGlobals {
+    type Target = VimCommandState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for VimGlobals {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct VimInputState {
+    pub editor: Option<WeakEntity<Editor>>,
+    pub command: VimCommandState,
+}
+
+impl VimInputState {
+    pub(crate) fn new(editor: WeakEntity<Editor>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            editor: Some(editor),
+            ..Self::default()
+        }))
+    }
+
+    fn swap(&mut self, globals: &mut VimGlobals) {
+        std::mem::swap(&mut self.command, &mut globals.command);
+    }
 }
 
 pub struct MarksState {
@@ -754,14 +803,66 @@ impl MarksState {
 impl Global for VimGlobals {}
 
 impl VimGlobals {
+    pub(crate) fn with_input<C, R>(
+        input: Rc<RefCell<VimInputState>>,
+        cx: &mut C,
+        run: impl FnOnce(&mut C) -> R,
+    ) -> R
+    where
+        C: BorrowMut<App>,
+    {
+        let globals = cx.borrow_mut().global_mut::<Self>();
+        let previous = globals.input.clone();
+        globals.input_depth += 1;
+        globals.activate_input(input);
+        let result = run(cx);
+        let globals = cx.borrow_mut().global_mut::<Self>();
+        globals.input_depth -= 1;
+        let input = if globals.input_depth == 0 {
+            globals.focused_input.clone()
+        } else {
+            previous
+        };
+        globals.activate_input(input);
+        result
+    }
+
+    pub(crate) fn focus_input(&mut self, input: Rc<RefCell<VimInputState>>) {
+        self.focused_input = input.clone();
+        if self.input_depth == 0 {
+            self.activate_input(input);
+        }
+    }
+
+    pub(crate) fn blur_input(&mut self, input: &Rc<RefCell<VimInputState>>) {
+        if Rc::ptr_eq(&self.focused_input, input) {
+            self.focus_input(Rc::default());
+        }
+    }
+
+    pub(crate) fn finish_recording(&mut self) {
+        self.recorded_actions = std::mem::take(&mut self.recording_actions);
+        self.recorded_count = self.recording_count.take();
+        self.recorded_selection = std::mem::take(&mut self.recording_selection);
+        self.recorded_register_for_dot = self.recording_register_for_dot.take();
+        self.dot_recording = false;
+        self.stop_recording_after_next_action = false;
+    }
+
     pub(crate) fn register(cx: &mut App) {
         cx.set_global(VimGlobals::default());
 
-        cx.observe_keystrokes(|event, _, cx| {
-            let Some(action) = event.action.as_ref().map(|action| action.boxed_clone()) else {
-                return;
-            };
-            Vim::globals(cx).observe_action(action.boxed_clone())
+        cx.observe_keystrokes(|event, window, cx| {
+            let vim = Vim::globals(cx)
+                .keystroke_observers
+                .iter()
+                .find(|(focus, _)| window.is_key_dispatching_to(focus))
+                .and_then(|(_, vim)| vim.upgrade());
+            if let Some(vim) = vim {
+                vim.update(cx, |vim, cx| vim.observe_keystrokes(event, window, cx));
+            } else if let Some(action) = event.action.as_ref() {
+                Self::observe_action_after_input(action.boxed_clone(), cx);
+            }
         })
         .detach();
 
@@ -966,17 +1067,39 @@ impl VimGlobals {
         })
     }
 
+    pub(crate) fn observe_action_after_input(action: Box<dyn Action>, cx: &mut App) {
+        let deferred_action = action.boxed_clone();
+        if Self::defer_input(
+            move |_, cx| Vim::globals(cx).observe_action(deferred_action),
+            cx,
+        ) {
+            return;
+        }
+        Vim::globals(cx).observe_action(action);
+    }
+
+    pub(crate) fn defer_input(
+        continuation: impl FnOnce(&mut Window, &mut App) + 'static,
+        cx: &mut App,
+    ) -> bool {
+        let input = Vim::globals(cx).input.clone();
+        let editor = input.borrow().editor.as_ref().and_then(WeakEntity::upgrade);
+        editor.is_some_and(|editor| {
+            editor.update(cx, |editor, _| {
+                editor.defer_external_input(move |window, cx| {
+                    Self::with_input(input, cx, |cx| continuation(window, cx));
+                })
+            })
+        })
+    }
+
     pub fn observe_action(&mut self, action: Box<dyn Action>) {
         if self.dot_recording {
             self.recording_actions
                 .push(ReplayableAction::Action(action.boxed_clone()));
 
             if self.stop_recording_after_next_action {
-                self.dot_recording = false;
-                self.recorded_actions = std::mem::take(&mut self.recording_actions);
-                self.recorded_count = self.recording_count.take();
-                self.recorded_register_for_dot = self.recording_register_for_dot.take();
-                self.stop_recording_after_next_action = false;
+                self.finish_recording();
             }
         }
         if self.replayer.is_none()
@@ -1000,11 +1123,7 @@ impl VimGlobals {
                 utf16_range_to_replace: range_to_replace.clone(),
             });
             if self.stop_recording_after_next_action {
-                self.dot_recording = false;
-                self.recorded_actions = std::mem::take(&mut self.recording_actions);
-                self.recorded_count = self.recording_count.take();
-                self.recorded_register_for_dot = self.recording_register_for_dot.take();
-                self.stop_recording_after_next_action = false;
+                self.finish_recording();
             }
         }
         if let Some(recording_register) = self.recording_register {
@@ -1019,6 +1138,14 @@ impl VimGlobals {
 
     pub fn focused_vim(&self) -> Option<Entity<Vim>> {
         self.focused_vim.as_ref().and_then(|vim| vim.upgrade())
+    }
+
+    fn activate_input(&mut self, input: Rc<RefCell<VimInputState>>) {
+        if !Rc::ptr_eq(&self.input, &input) {
+            self.input.clone().as_ref().borrow_mut().swap(self);
+            input.as_ref().borrow_mut().swap(self);
+            self.input = input;
+        }
     }
 }
 

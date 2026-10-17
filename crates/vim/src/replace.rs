@@ -184,39 +184,38 @@ impl Vim {
         self.clear_operator(window, cx);
     }
 
-    pub fn exchange_motion(
+    pub(crate) fn plan_exchange_motion(
         &mut self,
         motion: Motion,
         times: Option<usize>,
         forced_motion: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.stop_recording(cx);
-        self.update_editor(cx, |vim, editor, cx| {
-            editor.set_clip_at_line_ends(false, cx);
-            let text_layout_details = editor.text_layout_details(window, cx);
-            let mut selection = editor
-                .selections
-                .newest_display(&editor.display_snapshot(cx));
-            let snapshot = editor.snapshot(window, cx);
-            motion.expand_selection(
-                &snapshot,
-                &mut selection,
-                times,
-                &text_layout_details,
-                forced_motion,
-            );
-            let start = snapshot
-                .buffer_snapshot()
-                .anchor_before(selection.start.to_point(&snapshot));
-            let end = snapshot
-                .buffer_snapshot()
-                .anchor_before(selection.end.to_point(&snapshot));
-            let new_range = start..end;
-            vim.exchange_impl(new_range, editor, &snapshot, window, cx);
-            editor.set_clip_at_line_ends(true, cx);
-        });
+    ) -> Result<crate::GeometryCommit, editor::display_map::PendingRowGeometry> {
+        let newest_id = self.update_editor(cx, |_, editor, _| editor.selections.newest_anchor().id);
+        let ranges =
+            self.plan_selections(Some(false), window, cx, |map, details, mut selection| {
+                if Some(selection.id) != newest_id {
+                    return Ok(None);
+                }
+                motion.expand_selection(map, &mut selection, times, details, forced_motion)?;
+                let buffer = map.buffer_snapshot();
+                Ok(Some(
+                    buffer.anchor_before(selection.start.to_point(map))
+                        ..buffer.anchor_before(selection.end.to_point(map)),
+                ))
+            })?;
+        Ok(Box::new(move |vim, window, cx| {
+            vim.stop_recording(cx);
+            if let Some(range) = ranges.into_iter().flatten().next() {
+                vim.update_editor(cx, |vim, editor, cx| {
+                    editor.set_clip_at_line_ends(false, cx);
+                    let snapshot = editor.snapshot(window, cx);
+                    vim.exchange_impl(range, editor, &snapshot, window, cx);
+                    editor.set_clip_at_line_ends(true, cx);
+                });
+            }
+        }))
     }
 
     pub fn exchange_impl(

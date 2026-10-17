@@ -65,6 +65,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let text = text.clone();
+            self.defer_input(
+                move |editor, window, cx| {
+                    editor.do_paste(&text, clipboard_selections, handle_entire_lines, window, cx);
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -249,7 +260,10 @@ impl Editor {
         });
     }
 
-    pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn paste(&mut self, action: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::paste, window, cx) {
+            return;
+        }
         if let Some(item) = cx.read_from_clipboard() {
             self.paste_item(&item, window, cx);
         }
@@ -261,6 +275,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let item = item.clone();
+            self.defer_input(
+                move |editor, window, cx| editor.paste_item(&item, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -343,6 +366,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let filename = filename.to_owned();
+            self.defer_input(
+                move |editor, window, cx| editor.insert_image_snippet(&filename, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         let Some(snippet) = Snippet::parse(&format!("![$1]({filename})$0")).log_err() else {
             return;
         };
@@ -415,7 +447,10 @@ impl Editor {
         ClipboardItem::new_string_with_json_metadata(text, clipboard_selections)
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn cut(&mut self, action: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -425,10 +460,13 @@ impl Editor {
 
     pub(super) fn kill_ring_cut(
         &mut self,
-        _: &KillRingCut,
+        action: &KillRingCut,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -513,10 +551,13 @@ impl Editor {
 
     pub(super) fn kill_ring_yank(
         &mut self,
-        _: &KillRingYank,
+        action: &KillRingYank,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_yank, window, cx) {
+            return;
+        }
         if !cx.has_global::<KillRing>() {
             return;
         }
@@ -531,23 +572,32 @@ impl Editor {
 
     pub(super) fn copy_and_trim(
         &mut self,
-        _: &CopyAndTrim,
-        _: &mut Window,
+        action: &CopyAndTrim,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::copy_and_trim, window, cx) {
+            return;
+        }
         self.do_copy(true, cx);
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy(&mut self, action: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::copy, window, cx) {
+            return;
+        }
         self.do_copy(false, cx);
     }
 
     pub(super) fn diff_clipboard_with_selection(
         &mut self,
-        _: &DiffClipboardWithSelection,
+        action: &DiffClipboardWithSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::diff_clipboard_with_selection, window, cx) {
+            return;
+        }
         let selections = self
             .selections
             .all::<MultiBufferOffset>(&self.display_snapshot(cx));

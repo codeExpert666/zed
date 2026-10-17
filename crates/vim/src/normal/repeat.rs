@@ -135,6 +135,10 @@ impl Replayer {
     }
 
     pub fn next(self, window: &mut Window, cx: &mut App) {
+        let replayer = self.clone();
+        if VimGlobals::defer_input(move |window, cx| replayer.next(window, cx), cx) {
+            return;
+        }
         let mut lock = self.0.borrow_mut();
         let action = if lock.ix < 10000 {
             lock.actions.get(lock.ix).cloned()
@@ -158,7 +162,7 @@ impl Replayer {
             ReplayableAction::Action(action) => {
                 if should_replay(&*action) {
                     window.dispatch_action(action.boxed_clone(), cx);
-                    cx.defer(move |cx| Vim::globals(cx).observe_action(action.boxed_clone()));
+                    cx.defer(move |cx| VimGlobals::observe_action_after_input(action, cx));
                 }
             }
             ReplayableAction::Insertion {

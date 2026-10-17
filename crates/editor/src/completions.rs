@@ -14,6 +14,7 @@ impl Editor {
             text_system: window.text_system().clone(),
             editor_style: self.style.clone().unwrap_or_else(|| self.create_style(cx)),
             rem_size: window.rem_size(),
+            syntax: self.syntax_styling(),
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             visible_rows: self.visible_line_count(),
             vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
@@ -185,14 +186,17 @@ impl Editor {
     pub(super) fn visible_text_buffer_ranges(
         &self,
         cx: &mut Context<Editor>,
-    ) -> Vec<(
-        BufferSnapshot,
-        Range<BufferOffset>,
-        ExcerptRange<text::Anchor>,
-    )> {
+    ) -> Result<
+        Vec<(
+            BufferSnapshot,
+            Range<BufferOffset>,
+            ExcerptRange<text::Anchor>,
+        )>,
+        PendingRowGeometry,
+    > {
         let display_snapshot = self.display_snapshot(cx);
-        let visible_ranges = self.painted_text_ranges(&display_snapshot, cx);
-        Self::buffer_ranges(&display_snapshot, visible_ranges)
+        let visible_ranges = self.visible_text_ranges(&display_snapshot, cx)?;
+        Ok(Self::buffer_ranges(&display_snapshot, visible_ranges))
     }
 
     fn buffer_ranges(
@@ -880,6 +884,18 @@ impl Editor {
         cx: &mut Context<Editor>,
     ) -> Option<Task<Result<()>>> {
         use language::ToOffset as _;
+
+        if self.input_is_deferred() {
+            return Some(self.defer_input_task(
+                move |editor, window, cx| {
+                    editor
+                        .do_completion(item_ix, intent, window, cx)
+                        .unwrap_or_else(|| Task::ready(Ok(())))
+                },
+                window,
+                cx,
+            ));
+        }
 
         let CodeContextMenu::Completions(completions_menu) = self.hide_context_menu(window, cx)?
         else {

@@ -8,6 +8,7 @@ use collections::HashMap;
 use command_palette::CommandPalette;
 use editor::{
     AnchorRangeExt, DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
+    SelectionEffects,
     actions::{DeleteLine, WrapSelectionsInTag},
     code_context_menus::CodeContextMenu,
     display_map::DisplayRow,
@@ -16,7 +17,7 @@ use editor::{
 use futures::StreamExt;
 #[cfg(target_os = "windows")]
 use gpui::AppContext as _;
-use gpui::{KeyBinding, Modifiers, MouseButton, TestAppContext, px};
+use gpui::{Context, KeyBinding, Modifiers, MouseButton, TestAppContext, Window, px};
 use itertools::Itertools;
 use language::{CursorShape, Language, LanguageConfig, Point};
 pub use neovim_backed_test_context::*;
@@ -36,7 +37,7 @@ use workspace::notifications::{NotificationId, simple_message_notification::Mess
 use workspace::{DeploySearch, MultiWorkspace};
 
 use crate::{
-    PushSneak, PushSneakBackward, SwitchToNormalMode, VimAddon, insert::NormalBefore, motion,
+    PushSneak, PushSneakBackward, SwitchToNormalMode, Vim, VimAddon, insert::NormalBefore, motion,
     state::Mode,
 };
 
@@ -48,6 +49,98 @@ async fn test_initially_disabled(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, false).await;
     cx.simulate_keystrokes("h j k l");
     cx.assert_editor_state("hjklˇ");
+}
+
+#[gpui::test]
+async fn test_mode_change_preserves_authoritative_horizontal_positions(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(settings::SoftWrap::None, cx));
+    let source = format!(
+        "{}{}{}",
+        "x".repeat(100_000),
+        "😀".repeat(8),
+        "x".repeat(100_000)
+    );
+    let destination = "x".repeat(200_050);
+
+    for mode in [Mode::Insert, Mode::Visual] {
+        cx.set_state(&format!("ˇ\nxx\n{destination}"), Mode::Normal);
+        cx.background_executor.set_block_on_ticks(0..=0);
+        let vim = cx.update_editor(|editor, window, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                let start = Point::new(0, 0);
+                buffer.edit([(start..start, source.as_str())], None, cx);
+            });
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                let point = Point::new(0, 200_030);
+                selections.select_ranges([point..point]);
+            });
+            editor.addon::<VimAddon>().cloned().expect("vim")
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+                let assert_motion = |vim: &mut Vim, _: &mut Window, cx: &mut Context<Vim>| {
+                    assert_eq!(vim.mode, Mode::Normal);
+                    vim.update_editor(cx, |_, editor, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+                        assert_eq!(
+                            editor.selections.newest::<Point>(&snapshot).head(),
+                            Point::new(1, 1)
+                        );
+                    });
+                };
+                if !vim.defer_input(assert_motion, cx) {
+                    assert_motion(vim, window, cx);
+                }
+                vim.switch_mode(mode, false, window, cx);
+            });
+        });
+        let completion = cx.update_editor(|editor, _, cx| editor.input_completion(cx));
+        cx.background_executor.set_block_on_ticks(0..=50);
+        completion.await.expect("deferred motion and mode change");
+        let frozen = cx.update_editor(|editor, _, cx| {
+            assert_eq!(vim.entity.read(cx).mode, mode);
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).range()
+        });
+        let expected_end = if mode == Mode::Visual { 2 } else { 1 };
+        assert_eq!(frozen, Point::new(1, 1)..Point::new(1, expected_end));
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(editor.selections.newest::<Point>(&snapshot).range(), frozen);
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.switch_mode(Mode::Normal, false, window, cx);
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.update_editor(|editor, _, cx| editor.input_completion(cx))
+            .await
+            .expect("deferred mode change and motion");
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 200_014)
+            );
+        });
+    }
 }
 
 #[gpui::test]
@@ -1886,8 +1979,8 @@ async fn test_mouse_selection(cx: &mut TestAppContext) {
 
     cx.set_state("ˇone two three", Mode::Normal);
 
-    let start_point = cx.pixel_position("one twˇo three");
-    let end_point = cx.pixel_position("one ˇtwo three");
+    let start_point = cx.pixel_position("one twˇo three").await;
+    let end_point = cx.pixel_position("one ˇtwo three").await;
 
     cx.simulate_mouse_down(start_point, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_move(end_point, MouseButton::Left, Modifiers::none());
@@ -1902,9 +1995,9 @@ async fn test_mouse_drag_across_anchor_does_not_drift(cx: &mut TestAppContext) {
 
     cx.set_state("ˇone two three four", Mode::Normal);
 
-    let click_pos = cx.pixel_position("one ˇtwo three four");
-    let drag_left = cx.pixel_position("ˇone two three four");
-    let anchor_pos = cx.pixel_position("one tˇwo three four");
+    let click_pos = cx.pixel_position("one ˇtwo three four").await;
+    let drag_left = cx.pixel_position("ˇone two three four").await;
+    let anchor_pos = cx.pixel_position("one tˇwo three four").await;
 
     cx.simulate_mouse_down(click_pos, MouseButton::Left, Modifiers::none());
     cx.run_until_parked();

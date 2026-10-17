@@ -1,32 +1,463 @@
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use collections::HashMap;
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
-    AnyElement, App, AvailableSpace, ClickEvent, Context, DispatchPhase, Element, MouseButton,
-    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    ParentElement, Pixels, PressureStage, ScrollDelta, ScrollWheelEvent, Window, anchored,
-    deferred, point, px,
+    AnyElement, App, AvailableSpace, ClickEvent, Context, DispatchPhase, Element, Hitbox,
+    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    ParentElement, Pixels, PressureStage, ScrollDelta, ScrollWheelEvent, TextAlign, Window,
+    anchored, deferred, point, px,
 };
-use multi_buffer::MultiBufferRow;
+use multi_buffer::{Anchor, MultiBufferRow};
 use project::DisableAiSettings;
 use settings::Settings;
 use sum_tree::Bias;
 use text::SelectionGoal;
 use util::{RangeExt, debug_panic};
 
-use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSide};
+use super::{
+    EditorElement, EditorLayout, LineNumberLayout, PendingViewport, PositionMap, SplitSide,
+    layout_line,
+};
 use crate::{
     CURSORS_VISIBLE_FOR, ColumnarMode, DisplayDiffHunk, DisplayPoint, DisplayRow, Editor,
     EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
-    PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
+    PhantomDiffReviewIndicator, RowExt, SelectPhase, Selection, SelectionDragState,
     display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
     hover_popover::hover_at, inlays::inlay_hints::HintTarget, mouse_context_menu,
     scroll::ScrollPixelOffset,
 };
 
+#[derive(Default)]
+pub(super) struct PointerState {
+    button: Cell<Option<MouseButton>>,
+    down: Cell<Option<(gpui::Point<Pixels>, Anchor)>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PointerRow {
+    row: DisplayRow,
+    anchor: Anchor,
+    row_offset: i64,
+}
+
+impl PointerRow {
+    pub(super) fn new(row: DisplayRow, snapshot: &EditorSnapshot) -> Self {
+        let anchor = snapshot.display_point_to_anchor(row.as_display_point(), Bias::Left);
+        let row_offset = i64::from(row.0) - i64::from(anchor.to_display_point(snapshot).row().0);
+        Self {
+            row,
+            anchor,
+            row_offset,
+        }
+    }
+
+    fn resolve(&self, snapshot: &EditorSnapshot) -> DisplayRow {
+        let row = i64::from(self.anchor.to_display_point(snapshot).row().0) + self.row_offset;
+        DisplayRow(row.clamp(0, i64::from(snapshot.max_point().row().0)) as u32)
+    }
+}
+
+#[derive(Clone)]
+struct PendingPointerFrame {
+    text_hitbox: Hitbox,
+    gutter_hitbox: Hitbox,
+    content_origin: gpui::Point<Pixels>,
+    line_height: Pixels,
+    rem_size: Pixels,
+    em_advance: Pixels,
+    em_layout_width: Pixels,
+    scroll_position: gpui::Point<ScrollPixelOffset>,
+    scroll_max_y: ScrollPixelOffset,
+    text_align: TextAlign,
+    pointer_state: Rc<PointerState>,
+    rows: Arc<[PointerRow]>,
+}
+
+#[derive(Clone)]
+enum DeferredMouseEvent {
+    Down(MouseDownEvent, bool),
+    Up(MouseUpEvent),
+    Move(MouseMoveEvent),
+    Click(ClickEvent),
+    Pressure(MousePressureEvent),
+}
+
+impl DeferredMouseEvent {
+    fn position(&self) -> Option<gpui::Point<Pixels>> {
+        match self {
+            Self::Down(event, _) => Some(event.position),
+            Self::Up(event) => Some(event.position),
+            Self::Move(event) => Some(event.position),
+            Self::Click(event) => event.mouse_position(),
+            Self::Pressure(event) => Some(event.position),
+        }
+    }
+}
+
+impl PendingPointerFrame {
+    fn row_at(&self, position: gpui::Point<Pixels>) -> Option<PointerRow> {
+        let y = (position.y - self.text_hitbox.origin.y)
+            .max(Pixels::ZERO)
+            .min(self.text_hitbox.size.height);
+        let row = DisplayRow((f64::from(y / self.line_height) + self.scroll_position.y) as u32);
+        self.rows
+            .iter()
+            .rev()
+            .find(|candidate| candidate.row <= row)
+            .or_else(|| self.rows.first())
+            .copied()
+    }
+
+    fn dispatch(
+        self,
+        event: DeferredMouseEvent,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
+        let hovered = (
+            self.text_hitbox.is_hovered(window),
+            self.gutter_hitbox.is_hovered(window),
+        );
+        let received_at = Instant::now();
+        let deferred = self.clone();
+        let deferred_event = event.clone();
+        if !editor.defer_input(
+            move |editor, window, cx| {
+                deferred.replay(deferred_event, hovered, received_at, editor, window, cx);
+            },
+            window,
+            cx,
+        ) {
+            self.replay(event, hovered, received_at, editor, window, cx);
+        }
+    }
+
+    fn replay(
+        self,
+        event: DeferredMouseEvent,
+        hovered: (bool, bool),
+        received_at: Instant,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
+        let Some(position) = event.position() else {
+            return;
+        };
+        let Some(target) = self.row_at(position) else {
+            return;
+        };
+        let style = editor.style(cx).clone();
+        let snapshot = editor.snapshot(window, cx);
+        let row = target.resolve(&snapshot);
+        let line = match window.with_rem_size(Some(self.rem_size), |window| {
+            layout_line(
+                row,
+                &snapshot,
+                &style,
+                self.text_hitbox.size.width,
+                self.scroll_position.x * f64::from(self.em_layout_width),
+                |_| false,
+                window,
+                cx,
+            )
+        }) {
+            Ok(line) => line,
+            Err(pending) => {
+                editor.defer_geometry(
+                    pending,
+                    move |editor, window, cx| {
+                        self.replay(event, hovered, received_at, editor, window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        let scroll_position = point(
+            self.scroll_position.x,
+            self.scroll_position.y + row.as_f64() - target.row.as_f64(),
+        );
+        let mut position_map = PositionMap {
+            size: self.text_hitbox.size,
+            line_height: self.line_height,
+            rem_size: self.rem_size,
+            scroll_position,
+            scroll_pixel_position: point(
+                scroll_position.x * f64::from(self.em_layout_width),
+                scroll_position.y * f64::from(self.line_height),
+            ),
+            scroll_max: point(0., self.scroll_max_y),
+            horizontal_scroll_pending: true,
+            deferred_hit_test: Some(hovered),
+            deferred_point: None,
+            deferred_at: Some(received_at),
+            deferred_line_number: match &event {
+                DeferredMouseEvent::Down(_, hit) => Some(*hit),
+                _ => None,
+            },
+            pointer_state: self.pointer_state,
+            em_advance: self.em_advance,
+            em_layout_width: self.em_layout_width,
+            visible_row_range: row..row.next_row(),
+            line_layouts: Vec::new(),
+            snapshot,
+            text_align: self.text_align,
+            content_width: self.text_hitbox.size.width,
+            content_origin: self.content_origin,
+            text_hitbox: self.text_hitbox,
+            gutter_hitbox: self.gutter_hitbox,
+            inline_blame_bounds: None,
+            display_hunks: Vec::new(),
+            diff_hunk_control_bounds: Vec::new(),
+        };
+        let x = f64::from(position.x - position_map.text_hitbox.origin.x)
+            + scroll_position.x * f64::from(self.em_layout_width);
+        let point = position_map.resolve_point_for_position(row, x, Some(&line));
+        position_map.deferred_point = Some((position, point));
+        position_map.line_layouts.push(line);
+        match event {
+            DeferredMouseEvent::Down(event, _) => match event.button {
+                MouseButton::Left => EditorElement::mouse_left_down(
+                    editor,
+                    &event,
+                    &position_map,
+                    &HashMap::default(),
+                    window,
+                    cx,
+                ),
+                MouseButton::Right => {
+                    EditorElement::mouse_right_down(editor, &event, &position_map, window, cx)
+                }
+                MouseButton::Middle => {
+                    EditorElement::mouse_middle_down(editor, &event, &position_map, window, cx)
+                }
+                _ => {}
+            },
+            DeferredMouseEvent::Up(event) => {
+                EditorElement::mouse_up(editor, &event, &position_map, window, cx)
+            }
+            DeferredMouseEvent::Move(event) => {
+                EditorElement::mouse_dragged(editor, &event, &position_map, window, cx);
+                if editor.diff_review_drag_state.is_some() {
+                    editor.update_diff_review_drag(point.nearest_valid.row(), window, cx);
+                }
+            }
+            DeferredMouseEvent::Click(event) => {
+                EditorElement::click(editor, &event, &position_map, window, cx)
+            }
+            DeferredMouseEvent::Pressure(event) => {
+                EditorElement::pressure_click(editor, &event, &position_map, window, cx)
+            }
+        }
+    }
+}
+
 impl EditorElement {
+    pub(super) fn paint_pending_mouse_listeners(
+        &mut self,
+        layout: &PendingViewport,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.paint_scroll_wheel_listener(
+            layout.hitbox.clone(),
+            layout.line_height,
+            layout.em_layout_width,
+            point(0., layout.scroll_max_y),
+            true,
+            window,
+            cx,
+        );
+        let frame = PendingPointerFrame {
+            text_hitbox: layout.text_hitbox.clone(),
+            gutter_hitbox: layout.gutter_hitbox.clone(),
+            content_origin: layout.content_origin,
+            line_height: layout.line_height,
+            rem_size: layout.rem_size,
+            em_advance: layout.em_advance,
+            em_layout_width: layout.em_layout_width,
+            scroll_position: layout.scroll_position,
+            scroll_max_y: layout.scroll_max_y,
+            text_align: layout.text_align,
+            pointer_state: layout.pointer_state.clone(),
+            rows: Arc::from(layout.rows.as_slice()),
+        };
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            let frame = frame.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || window.default_prevented()
+                    || !(frame.text_hitbox.is_hovered(window)
+                        || frame.gutter_hitbox.is_hovered(window))
+                {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    frame.pointer_state.button.set(Some(event.button));
+                    if event.button == MouseButton::Left {
+                        *editor
+                            .pending_mouse_down
+                            .get_or_insert_with(Default::default)
+                            .borrow_mut() = Some(event.clone());
+                    }
+                    if !editor.focus_handle.is_focused(window) {
+                        editor.last_focused_descendant = None;
+                        window.focus(&editor.focus_handle, cx);
+                    }
+                    frame.clone().dispatch(
+                        DeferredMouseEvent::Down(event.clone(), false),
+                        editor,
+                        window,
+                        cx,
+                    );
+                });
+                cx.stop_propagation();
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            let frame = frame.clone();
+            let mut mouse_down = None;
+            let mut handle_up = false;
+            move |event: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    mouse_down = editor.update(cx, |editor, _| {
+                        handle_up = frame.pointer_state.button.take().is_some()
+                            || editor.has_pending_selection()
+                            || !matches!(editor.selection_drag_state, SelectionDragState::None)
+                            || editor.diff_review_drag_state.is_some();
+                        editor
+                            .pending_mouse_down
+                            .as_ref()
+                            .and_then(|pending| pending.borrow_mut().take())
+                    });
+                    handle_up |= mouse_down.is_some();
+                } else if handle_up {
+                    editor.update(cx, |editor, cx| {
+                        frame.clone().dispatch(
+                            DeferredMouseEvent::Up(event.clone()),
+                            editor,
+                            window,
+                            cx,
+                        );
+                        if let Some(down) = mouse_down.take()
+                            && frame.text_hitbox.is_hovered(window)
+                        {
+                            frame.clone().dispatch(
+                                DeferredMouseEvent::Click(ClickEvent::Mouse(MouseClickEvent {
+                                    down,
+                                    up: event.clone(),
+                                })),
+                                editor,
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            let frame = frame.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && matches!(
+                        event.pressed_button,
+                        Some(MouseButton::Left | MouseButton::Middle)
+                    )
+                {
+                    editor.update(cx, |editor, cx| {
+                        if frame.pointer_state.button.get().is_some()
+                            || editor.has_pending_selection()
+                            || !matches!(editor.selection_drag_state, SelectionDragState::None)
+                            || editor.diff_review_drag_state.is_some()
+                        {
+                            frame.clone().dispatch(
+                                DeferredMouseEvent::Move(event.clone()),
+                                editor,
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |event: &MousePressureEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble && frame.text_hitbox.is_hovered(window) {
+                    editor.update(cx, |editor, cx| {
+                        frame.clone().dispatch(
+                            DeferredMouseEvent::Pressure(event.clone()),
+                            editor,
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }
+        });
+    }
+
+    fn defer_mouse_input(
+        editor: &mut Editor,
+        event: DeferredMouseEvent,
+        position_map: &PositionMap,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> bool {
+        if position_map.deferred_hit_test.is_some() || !editor.input_is_deferred() {
+            return false;
+        }
+        let Some(position) = event.position() else {
+            return false;
+        };
+        let y = (position.y - position_map.text_hitbox.origin.y)
+            .max(Pixels::ZERO)
+            .min(position_map.size.height);
+        let row = DisplayRow(
+            (f64::from(y / position_map.line_height) + position_map.scroll_position.y) as u32,
+        );
+        let target = PointerRow::new(row, &position_map.snapshot);
+        let frame = PendingPointerFrame {
+            text_hitbox: position_map.text_hitbox.clone(),
+            gutter_hitbox: position_map.gutter_hitbox.clone(),
+            content_origin: position_map.content_origin,
+            line_height: position_map.line_height,
+            rem_size: position_map.rem_size,
+            em_advance: position_map.em_advance,
+            em_layout_width: position_map.em_layout_width,
+            scroll_position: position_map.scroll_position,
+            scroll_max_y: position_map.scroll_max.y,
+            text_align: position_map.text_align,
+            pointer_state: position_map.pointer_state.clone(),
+            rows: Arc::from([target]),
+        };
+        let hovered = (
+            position_map.text_is_hovered(window),
+            position_map.gutter_is_hovered(window),
+        );
+        let received_at = Instant::now();
+        editor.defer_input(
+            move |editor, window, cx| {
+                frame.replay(event, hovered, received_at, editor, window, cx);
+            },
+            window,
+            cx,
+        )
+    }
+
     pub(crate) fn mouse_moved(
         editor: &mut Editor,
         event: &MouseMoveEvent,
@@ -35,11 +466,9 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        let text_hitbox = &position_map.text_hitbox;
-        let gutter_hitbox = &position_map.gutter_hitbox;
         let modifiers = event.modifiers;
-        let text_hovered = text_hitbox.is_hovered(window);
-        let gutter_hovered = gutter_hitbox.is_hovered(window);
+        let text_hovered = position_map.text_is_hovered(window);
+        let gutter_hovered = position_map.gutter_is_hovered(window);
         editor.set_gutter_hovered(gutter_hovered, cx);
 
         let point_for_position = position_map.point_for_position(event.position);
@@ -357,7 +786,15 @@ impl EditorElement {
             return;
         }
 
-        self.paint_scroll_wheel_listener(layout, window, cx);
+        self.paint_scroll_wheel_listener(
+            layout.hitbox.clone(),
+            layout.position_map.line_height,
+            layout.position_map.em_layout_width,
+            layout.position_map.scroll_max,
+            layout.position_map.horizontal_scroll_pending,
+            window,
+            cx,
+        );
 
         window.on_mouse_event({
             let position_map = layout.position_map.clone();
@@ -418,14 +855,15 @@ impl EditorElement {
                 // Clear the pending mouse down during the capture phase,
                 // so that it happens even if another event handler stops
                 // propagation.
-                DispatchPhase::Capture => editor.update(cx, |editor, _cx| {
+                DispatchPhase::Capture => editor.update(cx, |editor, _| {
+                    position_map.pointer_state.button.set(None);
                     let pending_mouse_down = editor
                         .pending_mouse_down
                         .get_or_insert_with(Default::default)
                         .clone();
 
                     let mut pending_mouse_down = pending_mouse_down.borrow_mut();
-                    if pending_mouse_down.is_some() && position_map.text_hitbox.is_hovered(window) {
+                    if pending_mouse_down.is_some() && position_map.text_is_hovered(window) {
                         captured_mouse_down = pending_mouse_down.take();
                         window.refresh();
                     }
@@ -470,6 +908,15 @@ impl EditorElement {
                         if event.pressed_button == Some(MouseButton::Left)
                             || event.pressed_button == Some(MouseButton::Middle)
                         {
+                            if Self::defer_mouse_input(
+                                editor,
+                                DeferredMouseEvent::Move(event.clone()),
+                                &position_map,
+                                window,
+                                cx,
+                            ) {
+                                return;
+                            }
                             Self::mouse_dragged(editor, event, &position_map, window, cx)
                         }
 
@@ -482,14 +929,16 @@ impl EditorElement {
 
     fn paint_scroll_wheel_listener(
         &mut self,
-        layout: &EditorLayout,
+        hitbox: Hitbox,
+        line_height: Pixels,
+        glyph_width: Pixels,
+        scroll_max: gpui::Point<ScrollPixelOffset>,
+        horizontal_scroll_pending: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
         window.on_mouse_event({
-            let position_map = layout.position_map.clone();
             let editor = self.editor.clone();
-            let hitbox = layout.hitbox.clone();
             let mut delta = ScrollDelta::default();
 
             // Set a minimum scroll_sensitivity of 0.01 to make sure the user doesn't
@@ -532,8 +981,6 @@ impl EditorElement {
                         };
 
                         editor.update(cx, |editor, cx| {
-                            let line_height = position_map.line_height;
-                            let glyph_width = position_map.em_layout_width;
                             let delta = match delta {
                                 gpui::ScrollDelta::Pixels(mut pixels) => {
                                     //Trackpad
@@ -549,7 +996,7 @@ impl EditorElement {
                                 }
                             };
 
-                            let current_scroll_position = position_map.snapshot.scroll_position();
+                            let current_scroll_position = editor.scroll_position(cx);
                             let x = (current_scroll_position.x
                                 * ScrollPixelOffset::from(glyph_width)
                                 - ScrollPixelOffset::from(delta.x * scroll_sensitivity))
@@ -558,8 +1005,14 @@ impl EditorElement {
                                 * ScrollPixelOffset::from(line_height)
                                 - ScrollPixelOffset::from(delta.y * scroll_sensitivity))
                                 / ScrollPixelOffset::from(line_height);
-                            let mut scroll_position =
-                                point(x, y).clamp(&point(0., 0.), &position_map.scroll_max);
+                            let mut scroll_position = point(
+                                if horizontal_scroll_pending {
+                                    x.max(0.)
+                                } else {
+                                    x.clamp(0., scroll_max.x)
+                                },
+                                y.clamp(0., scroll_max.y),
+                            );
                             let forbid_vertical_scroll =
                                 editor.scroll_manager.forbid_vertical_scroll();
                             if forbid_vertical_scroll {
@@ -585,11 +1038,9 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if window.default_prevented() {
+        if position_map.deferred_hit_test.is_none() && window.default_prevented() {
             return;
         }
-
-        let text_hitbox = &position_map.text_hitbox;
         let gutter_hitbox = &position_map.gutter_hitbox;
         let point_for_position = position_map.point_for_position(event.position);
         let mut click_count = event.click_count;
@@ -609,17 +1060,62 @@ impl EditorElement {
                         .then(|| multi_buffer_range.clone()),
                 })
         {
-            editor.toggle_single_diff_hunk(hovered_hunk, cx);
-            cx.notify();
+            let deferred_hunk = hovered_hunk.clone();
+            if !editor.defer_input(
+                move |editor, _, cx| {
+                    editor.toggle_single_diff_hunk(deferred_hunk, cx);
+                    cx.notify();
+                },
+                window,
+                cx,
+            ) {
+                editor.toggle_single_diff_hunk(hovered_hunk, cx);
+                cx.notify();
+            }
             return;
-        } else if gutter_hitbox.is_hovered(window) {
+        } else if position_map.gutter_is_hovered(window) {
             click_count = 3; // Simulate triple-click when clicking the gutter to select lines
-        } else if !text_hitbox.is_hovered(window) {
+        } else if !position_map.text_is_hovered(window) {
             return;
         }
 
-        let hint_glyph = text_hitbox
-            .is_hovered(window)
+        if position_map.deferred_hit_test.is_none() {
+            position_map.pointer_state.button.set(Some(event.button));
+        }
+        let line_number_hit = position_map.deferred_line_number.unwrap_or_else(|| {
+            let row = position_map
+                .snapshot
+                .display_point_to_point(
+                    point_for_position.exact_unclipped.row().as_display_point(),
+                    Bias::Right,
+                )
+                .row;
+            line_numbers.get(&MultiBufferRow(row)).is_some_and(|line| {
+                line.segments.iter().any(|segment| {
+                    segment
+                        .hitbox
+                        .as_ref()
+                        .is_some_and(|hitbox| hitbox.contains(&event.position))
+                })
+            })
+        });
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Down(event.clone(), line_number_hit),
+            position_map,
+            window,
+            cx,
+        ) {
+            if !editor.focus_handle.is_focused(window) {
+                editor.last_focused_descendant = None;
+                window.focus(&editor.focus_handle, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        let hint_glyph = position_map
+            .text_is_hovered(window)
             .then(|| position_map.inlay_hint_glyph_for_position(event.position))
             .flatten();
         if !event.modifiers.modified()
@@ -674,10 +1170,17 @@ impl EditorElement {
             let snapshot = editor.snapshot(window, cx);
             let selection = newest_anchor.map(|anchor| anchor.to_display_point(&snapshot));
             if point_for_position.intersects_selection(&selection) {
+                let anchor = position_map
+                    .snapshot
+                    .display_point_to_anchor(point_for_position.nearest_valid, Bias::Left);
+                position_map
+                    .pointer_state
+                    .down
+                    .set(Some((event.position, anchor)));
                 editor.selection_drag_state = SelectionDragState::ReadyToDrag {
                     selection: *newest_anchor,
                     click_position: event.position,
-                    mouse_down_time: Instant::now(),
+                    mouse_down_time: position_map.deferred_at.unwrap_or_else(Instant::now),
                 };
                 cx.stop_propagation();
                 return;
@@ -733,17 +1236,7 @@ impl EditorElement {
                 .snapshot
                 .display_point_to_point(DisplayPoint::new(DisplayRow(display_row), 0), Bias::Right)
                 .row;
-            if line_numbers
-                .get(&MultiBufferRow(multi_buffer_row))
-                .is_some_and(|line_layout| {
-                    line_layout.segments.iter().any(|segment| {
-                        segment
-                            .hitbox
-                            .as_ref()
-                            .is_some_and(|hitbox| hitbox.contains(&event.position))
-                    })
-                })
-            {
+            if line_number_hit {
                 let line_offset_from_top = display_row - position_map.scroll_position.y as u32;
 
                 editor.open_excerpts_common(
@@ -806,7 +1299,16 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if position_map.gutter_hitbox.is_hovered(window) {
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Down(event.clone(), false),
+            position_map,
+            window,
+            cx,
+        ) {
+            return;
+        }
+        if position_map.gutter_is_hovered(window) {
             let gutter_right_padding = editor.gutter_dimensions.right_padding;
             let hitbox = &position_map.gutter_hitbox;
 
@@ -826,7 +1328,7 @@ impl EditorElement {
             return;
         }
 
-        if !position_map.text_hitbox.is_hovered(window) {
+        if !position_map.text_is_hovered(window) {
             return;
         }
 
@@ -848,7 +1350,25 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if !position_map.text_hitbox.is_hovered(window) || window.default_prevented() {
+        if !position_map.text_is_hovered(window)
+            || position_map.deferred_hit_test.is_none() && window.default_prevented()
+        {
+            return;
+        }
+        if position_map.deferred_hit_test.is_none() {
+            position_map.pointer_state.button.set(Some(event.button));
+        }
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Down(event.clone(), false),
+            position_map,
+            window,
+            cx,
+        ) {
+            if !editor.focus_handle.is_focused(window) {
+                editor.last_focused_descendant = None;
+                window.focus(&editor.focus_handle, cx);
+            }
             return;
         }
 
@@ -874,6 +1394,15 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Up(event.clone()),
+            position_map,
+            window,
+            cx,
+        ) {
+            return;
+        }
         // Handle diff review drag completion
         if editor.diff_review_drag_state.is_some() {
             editor.end_diff_review_drag(window, cx);
@@ -881,7 +1410,6 @@ impl EditorElement {
             return;
         }
 
-        let text_hitbox = &position_map.text_hitbox;
         let end_selection = editor.has_pending_selection();
         let pending_nonempty_selections = editor.has_pending_nonempty_selection();
         let point_for_position = position_map.point_for_position(event.position);
@@ -913,7 +1441,7 @@ impl EditorElement {
                 let snapshot = editor.snapshot(window, cx);
                 let selection_display = selection.map(|anchor| anchor.to_display_point(&snapshot));
                 if !point_for_position.intersects_selection(&selection_display)
-                    && text_hitbox.is_hovered(window)
+                    && position_map.text_is_hovered(window)
                 {
                     let is_cut = !(cfg!(target_os = "macos") && event.modifiers.alt
                         || cfg!(not(target_os = "macos")) && event.modifiers.control);
@@ -947,7 +1475,7 @@ impl EditorElement {
                 clippy::needless_return,
                 reason = "The cfg-block below makes this a false positive"
             )]
-            if !text_hitbox.is_hovered(window) || editor.read_only(cx) {
+            if !position_map.text_is_hovered(window) || editor.read_only(cx) {
                 return;
             }
 
@@ -980,7 +1508,15 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        let text_hitbox = &position_map.text_hitbox;
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Click(event.clone()),
+            position_map,
+            window,
+            cx,
+        ) {
+            return;
+        }
         let pending_nonempty_selections = editor.has_pending_nonempty_selection();
 
         let hovered_link_modifier = Editor::is_cmd_or_ctrl_pressed(&event.modifiers(), cx);
@@ -992,7 +1528,7 @@ impl EditorElement {
 
         if let Some(mouse_position) = event.mouse_position()
             && !pending_nonempty_selections
-            && text_hitbox.is_hovered(window)
+            && position_map.text_is_hovered(window)
             && !matches!(
                 editor.selection_drag_state,
                 SelectionDragState::Dragging { .. }
@@ -1030,14 +1566,22 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        let text_hitbox = &position_map.text_hitbox;
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Pressure(event.clone()),
+            position_map,
+            window,
+            cx,
+        ) {
+            return;
+        }
         let force_click_possible =
             matches!(editor.prev_pressure_stage, Some(PressureStage::Normal))
                 && event.stage == PressureStage::Force;
 
         editor.prev_pressure_stage = Some(event.stage);
 
-        if force_click_possible && text_hitbox.is_hovered(window) {
+        if force_click_possible && position_map.text_is_hovered(window) {
             let point = position_map.point_for_position(event.position);
             editor.handle_click_hovered_link(point, event.modifiers, window, cx);
             editor.selection_drag_state = SelectionDragState::None;
@@ -1052,7 +1596,16 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if editor.has_autoscroll_request()
+        if Self::defer_mouse_input(
+            editor,
+            DeferredMouseEvent::Move(event.clone()),
+            position_map,
+            window,
+            cx,
+        ) {
+            return;
+        }
+        if position_map.deferred_hit_test.is_none() && editor.has_autoscroll_request()
             || !editor.has_pending_selection()
                 && matches!(editor.selection_drag_state, SelectionDragState::None)
         {
@@ -1112,7 +1665,7 @@ impl EditorElement {
                 } => {
                     drop_cursor.start = drop_anchor;
                     drop_cursor.end = drop_anchor;
-                    *hide_drop_cursor = !text_hitbox.is_hovered(window);
+                    *hide_drop_cursor = !position_map.text_is_hovered(window);
                     editor.apply_scroll_delta(scroll_delta, window, cx);
                     cx.notify();
                 }
@@ -1127,7 +1680,12 @@ impl EditorElement {
                             .delay
                             .0,
                     );
-                    if mouse_down_time.elapsed() >= drag_and_drop_delay {
+                    if position_map
+                        .deferred_at
+                        .unwrap_or_else(Instant::now)
+                        .saturating_duration_since(*mouse_down_time)
+                        >= drag_and_drop_delay
+                    {
                         let drop_cursor = Selection {
                             id: editor.selections.next_selection_id(),
                             start: drop_anchor,
@@ -1143,11 +1701,21 @@ impl EditorElement {
                         editor.apply_scroll_delta(scroll_delta, window, cx);
                         cx.notify();
                     } else {
-                        let click_point = position_map.point_for_position(*click_position);
+                        let click_point = position_map
+                            .pointer_state
+                            .down
+                            .get()
+                            .filter(|(position, _)| position == click_position)
+                            .map(|(_, anchor)| anchor.to_display_point(&position_map.snapshot))
+                            .unwrap_or_else(|| {
+                                position_map
+                                    .point_for_position(*click_position)
+                                    .nearest_valid
+                            });
                         editor.selection_drag_state = SelectionDragState::None;
                         editor.select(
                             SelectPhase::Begin {
-                                position: click_point.nearest_valid,
+                                position: click_point,
                                 add: false,
                                 click_count: 1,
                             },
