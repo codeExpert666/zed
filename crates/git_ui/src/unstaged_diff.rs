@@ -8,6 +8,7 @@ use editor::{
     DiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk},
 };
+use futures::future::BoxFuture;
 use git::{StageAll, StageAndNext};
 use gpui::{
     Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -522,8 +523,8 @@ impl SerializableItem for UnstagedDiff {
         _: workspace::ItemId,
         _: bool,
         _: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>> {
-        Some(Task::ready(Ok(())))
+    ) -> Option<BoxFuture<'static, Result<()>>> {
+        Some(Box::pin(async { Ok(()) }))
     }
 
     fn should_serialize(&self, _: &Self::Event) -> bool {

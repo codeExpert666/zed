@@ -11,6 +11,7 @@ use crate::{
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
+use futures::future::BoxFuture;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
@@ -4951,7 +4952,7 @@ impl workspace::SerializableItem for GitGraph {
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<gpui::Result<()>>> {
+    ) -> Option<BoxFuture<'static, gpui::Result<()>>> {
         let workspace_id = workspace.database_id()?;
         let repo = self.get_repository(cx)?;
         let repo_working_path = repo
@@ -4982,7 +4983,7 @@ impl workspace::SerializableItem for GitGraph {
         ));
 
         let db = persistence::GitGraphsDb::global(cx);
-        Some(cx.background_spawn(async move {
+        Some(Box::pin(async move {
             db.save_git_graph(
                 item_id,
                 workspace_id,

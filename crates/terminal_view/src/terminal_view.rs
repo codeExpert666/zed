@@ -8,6 +8,7 @@ use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
 };
+use futures::future::BoxFuture;
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, Corners, DismissEvent, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton,
@@ -1973,9 +1974,9 @@ impl Item for TerminalView {
                     "Updating workspace id for the terminal, old: {old_id:?}, new: {new_id:?}",
                 );
                 let db = TerminalDb::global(cx);
-                let item_id = workspace::persistent_item_id(&cx.entity(), cx);
+                let entity_id = cx.entity_id().as_u64();
                 cx.background_spawn(async move {
-                    db.update_workspace_id(new_id, old_id, item_id).await
+                    db.update_workspace_id(new_id, old_id, entity_id).await
                 })
                 .detach();
             }
@@ -2009,7 +2010,7 @@ impl SerializableItem for TerminalView {
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<anyhow::Result<()>>> {
+    ) -> Option<BoxFuture<'static, anyhow::Result<()>>> {
         let terminal = self.terminal().read(cx);
         if terminal.task().is_some() {
             return None;
@@ -2025,7 +2026,7 @@ impl SerializableItem for TerminalView {
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
-        Some(cx.background_spawn(async move {
+        Some(Box::pin(async move {
             if let Some(cwd) = cwd {
                 db.save_working_directory(item_id, workspace_id, cwd)
                     .await?;
@@ -2080,7 +2081,7 @@ impl SerializableItem for TerminalView {
                 .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
                 .await?;
             cx.update(|window, cx| {
-                let view = cx.new(|cx| {
+                cx.new(|cx| {
                     let mut view = TerminalView::new(
                         terminal,
                         workspace,
@@ -2093,11 +2094,7 @@ impl SerializableItem for TerminalView {
                         view.custom_title = custom_title;
                     }
                     view
-                });
-                if workspace::claim_persistent_item_id(&view, item_id, cx) != item_id {
-                    view.update(cx, |view, _| view.needs_serialize = true);
-                }
-                view
+                })
             })
         })
     }

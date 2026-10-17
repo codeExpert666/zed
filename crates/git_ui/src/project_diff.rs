@@ -11,6 +11,7 @@ use editor::{
     DefaultDiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
+use futures::future::BoxFuture;
 use git::{Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -631,8 +632,8 @@ impl SerializableItem for ProjectDiff {
         _: workspace::ItemId,
         _: bool,
         _: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>> {
-        Some(Task::ready(Ok(())))
+    ) -> Option<BoxFuture<'static, Result<()>>> {
+        Some(Box::pin(async { Ok(()) }))
     }
 
     fn should_serialize(&self, _: &Self::Event) -> bool {

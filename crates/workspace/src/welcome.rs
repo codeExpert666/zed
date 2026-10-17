@@ -1,7 +1,7 @@
 use crate::{
     NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
     ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
-    item::{Item, ItemEvent},
+    item::{BoxFuture, Item, ItemEvent},
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
@@ -586,12 +586,12 @@ impl crate::SerializableItem for WelcomePage {
         item_id: crate::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<gpui::Result<()>>> {
+    ) -> Option<BoxFuture<'static, gpui::Result<()>>> {
         let workspace_id = workspace.database_id()?;
         let db = persistence::WelcomePagesDb::global(cx);
-        Some(cx.background_spawn(
-            async move { db.save_welcome_page(item_id, workspace_id, true).await },
-        ))
+        Some(Box::pin(async move {
+            db.save_welcome_page(item_id, workspace_id, true).await
+        }))
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
